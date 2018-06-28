@@ -38,6 +38,9 @@ from SystemConfiguration import SCDynamicStoreCopyConsoleUser
 DEFAULT_LD_LABEL = "com.contoso.deferred-policy"
 # Trigger: What custom trigger should be called to actually kick off the policy?
 DEFAULT_LD_JAMF_TRIGGER = "trigger_for_deferred_policy"
+# Max time: What is the maximum time we will allow for deferral? 
+# 604800 is 7 days.
+DEFAULT_LD_MAX_TIME = "604800"
 
 # If any app listed here is running on the client, no GUI prompts will be shown
 # and this program will exit silently with a non-zero exit code.
@@ -48,13 +51,14 @@ BLOCKING_APPS = ['Keynote', 'Microsoft PowerPoint']
 JAMF = "/usr/local/bin/jamf"
 JAMFHELPER = ("/Library/Application Support/JAMF/bin/jamfHelper.app/Contents"
               "/MacOS/jamfHelper")
+LAUNCHCTL = "/bin/launchctl"
 
 # Prompt GUI Config
 GUI_WINDOW_TITLE = "IT Notification"
-GUI_HEADING = "Software Updates are ready to be installed."
+GUI_HEADING_DEFAULT = "Software Updates are ready to be installed."
 GUI_ICON = ("/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources"
             "/AlertCautionIcon.icns")
-GUI_MESSAGE = """Software updates are available for your Mac.
+GUI_MESSAGE_DEFAULT = """Software updates are available for your Mac.
 
 NOTE: Some required updates will require rebooting your computer once installed.
 
@@ -63,7 +67,8 @@ You may schedule these updates for a convenient time by choosing when to start i
 # The order here is important as it affects the display of deferment options in
 # the GUI prompt. We set 300 (i.e. a five minute delay) as the first and
 # therefore default option.
-GUI_DEFER_OPTIONS = ["300", "0", "1800", "3600", "14400", "43200", "604800"]
+GUI_DEFER_OPTIONS = ["300", "0", "1800", "3600", "14400", "43200",
+                     "86400", "259200", "432000", "604800"]
 GUI_BUTTON = "Okay"
 
 # Confirmation dialog Config
@@ -85,11 +90,17 @@ GUI_E_MESSAGE = ("A problem occurred processing your request. Please contact "
 # Program Logic
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
+
+def get_console_user(store=None):
+    username, uid, gid = (SCDynamicStoreCopyConsoleUser(None, None, None) or [None])
+    username = [username,""][username in [u'loginwindow', None, u'']]
+    return (username, uid)
+
+
 def choices_with_default(choices, default):
     """This closure defines an argparser custom action that ensures an argument
        value is in a list of choices, and if not, sets the argument to a default
        value.
-
        Implementing this argparser action instead of using only a 'choices' list
        for the argument works better for a script called from Jamf where an
        optional parameter may be omitted from the policy definition, but
@@ -121,15 +132,19 @@ def build_argparser():
                         default=DEFAULT_LD_LABEL, nargs="?")
     parser.add_argument("jamf_trigger",
                         default=DEFAULT_LD_JAMF_TRIGGER, nargs="?")
+    parser.add_argument("max_time",
+                        default=DEFAULT_LD_MAX_TIME, nargs="?")
+    parser.add_argument("gui_heading",
+                        default=GUI_HEADING_DEFAULT, nargs="?")
+    parser.add_argument("gui_message",
+                        default=GUI_MESSAGE_DEFAULT, nargs="?")
     return parser.parse_known_args()[0]
 
 
 def calculate_deferment(add_seconds):
     """Returns the timedelta day, hour and minute of the chosen deferment
-
     Args:
         (int) add_seconds: Number of seconds into the future to calculate
-
     Returns:
         (int) day: Day of the month
         (int) hour: Hour of the day
@@ -146,26 +161,28 @@ def calculate_deferment(add_seconds):
             str(future.strftime("%B %-d at %-I:%M %p")))
 
 
-def display_prompt():
+def display_prompt(gui_heading, gui_message, gui_deferral, jamfhelper_uid):
     """Displays prompt to allow user to schedule update installation
-
     Args:
-        None
-
+        (str) gui_heading: Heading for window
+        (str) gui_message: Message for window
+        (list) gui_deferral: List of deferral times (as strs), 
+                             capped at max in main.
+        (int) jamfhelper_uid: UID of console_user for launchctl
     Returns:
         (int) defer_seconds: Number of seconds user wishes to defer policy
         OR
         None if an error occurs
     """
-    cmd = [JAMFHELPER,
+    cmd = [LAUNCHCTL, 'asuser', str(jamfhelper_uid), JAMFHELPER,
            '-windowType', 'utility',
            '-title', GUI_WINDOW_TITLE,
-           '-heading', GUI_HEADING,
+           '-heading', gui_heading,
            '-icon', GUI_ICON,
-           '-description', GUI_MESSAGE,
+           '-description', gui_message,
            '-button1', GUI_BUTTON,
            '-showDelayOptions',
-           ' '.join(GUI_DEFER_OPTIONS),
+           ' '.join(gui_deferral),
            '-lockHUD']
     error_values = ['2', '3', '239', '243', '250', '255']
     # Instead of returning an error code to stderr, jamfHelper always returns 0
@@ -195,16 +212,16 @@ def display_prompt():
         return None
 
 
-def display_confirm(start_date):
+def display_confirm(start_date, jamfhelper_uid):
     """Displays confirmation of when user scheduled update to install
-
     Args:
         (str) start_date: human-readable datetime of scheduled install
-
+        (int) jamfhelper_uid: UID of console user for launchctl.
     Returns:
         None
     """
-    confirm = subprocess.check_output([JAMFHELPER,
+    confirm = subprocess.check_output([LAUNCHCTL, 'asuser',
+                                       str(jamfhelper_uid), JAMFHELPER,
                                        '-windowType', 'utility',
                                        '-title', GUI_WINDOW_TITLE,
                                        '-heading', GUI_S_HEADING,
@@ -216,9 +233,15 @@ def display_confirm(start_date):
                                        '-lockHUD'])
 
 
-def display_error():
-    """Displays a generic error if a problem occurs"""
-    errmsg = subprocess.check_output([JAMFHELPER,
+def display_error(jamfhelper_uid):
+    """Displays a generic error if a problem occurs
+    Args:
+        (int) jamfhelper_uid: UID of console user for launchctl.
+    Returns:
+        None
+    """
+    errmsg = subprocess.check_output([LAUNCHCTL, 'asuser',
+                                      str(jamfhelper_uid), JAMFHELPER,
                                       '-windowType', 'utility',
                                       '-title', GUI_WINDOW_TITLE,
                                       '-heading', GUI_E_HEADING,
@@ -241,10 +264,8 @@ def get_running_apps():
 
 def detect_blocking_apps():
     """Determines if any blocking apps are running
-
     Args:
         none
-
     Returns:
         (bool) true/false if any blocking app is running
     """
@@ -257,8 +278,16 @@ def detect_blocking_apps():
     return blocking_app_running
 
 
-def write_launchdaemon(job_definition, path):
-    """Writes the passed job definition to a LaunchDaemon"""
+def write_launchdaemon(job_definition, path, label, kickstart):
+    """Writes the passed job definition to a LaunchDaemon
+    Args:
+        (dict) job_definition: job as defined in main
+        (str) path: path to LaunchDaemon
+        (str) label: plist/LaunchDaemon label
+        (bool) kickstart: If True, kickstart LaunchDaemon (run immediately)
+    Returns:
+        None
+    """
 
     success = True
 
@@ -282,15 +311,46 @@ def write_launchdaemon(job_definition, path):
         print "Unable to set ownership on LaunchDaemon!"
         success = False
 
-    # Load job
-    load_job = subprocess.Popen(['launchctl', 'load', path],
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE)
-    load_job.communicate()
-
-    if load_job.returncode > 0:
-        print "Unable to load LaunchDaemon!"
+    # Load job properly.
+    try:
+        bootstrap_job = subprocess.Popen([LAUNCHCTL, 'bootstrap',
+                                          'system', path],
+                                         stdout=subprocess.PIPE,
+                                         stderr=subprocess.PIPE)
+        bootstrap_job.communicate()
+        if bootstrap_job.returncode > 0:
+            print "Unable to bootstrap LaunchDaemon!"
+            success = False
+    except:
+        print "Unable to use launchctl!"
         success = False
+
+    domain_target = 'system/' + label
+    try:
+        enable_job = subprocess.Popen([LAUNCHCTL, 'enable', domain_target],
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE)
+        enable_job.communicate()
+        if enable_job.returncode > 0:
+            print "Unable to enable LaunchDaemon!"
+            success = False
+    except:
+        print "Unable to use launchctl!"
+        success = False
+
+    if kickstart:
+        try:
+            kickstart_job = subprocess.Popen([LAUNCHCTL, 'kickstart',
+                                              domain_target],
+                                              stdout=subprocess.PIPE,
+                                              stderr=subprocess.PIPE)
+            kickstart_job.communicate()
+            if kickstart_job.returncode > 0:
+                print "Unable to kickstart LaunchDaemon!"
+                success = False
+        except:
+            print "Unable to use launchctl!"
+            success = False
 
     return success
 
@@ -313,9 +373,9 @@ def main():
                            '{}.plist'.format(ld_label))
 
     if args.mode == 'prompt':
-        # Ensure a user is logged in
-        consoleuser = SCDynamicStoreCopyConsoleUser(None, None, None)[0]
-        if not consoleuser:
+
+        console_user, console_user_uid = get_console_user()
+        if not console_user:
             print "No user is logged in, so the prompt cannot appear. Exiting."
             sys.exit(1)
 
@@ -329,11 +389,35 @@ def main():
             print "One or more blocking apps are running."
             sys.exit(1)
 
+        # Get the maximum time we will allow. 5 minutes is the absolute minimum.
+        if args.max_time == "":
+            maximum_time = DEFAULT_LD_MAX_TIME
+        elif args.max_time < 300:
+            maximum_time = 300
+        else:
+            maximum_time = args.max_time
+        # Cycle through the default times. If they are less than or equal to 
+        # the maximum time, keep them. Otherwise discard. Bottom floor will
+        # always be 5 minutes.
+        defer_max = [option for option in GUI_DEFER_OPTIONS
+                if int(option) <= int(maximum_time)]
+
+        # Use defaults for the message if no args were passed.
+        if args.gui_heading == "":
+            gui_head = GUI_HEADING_DEFAULT
+        else:
+             gui_head = args.gui_heading
+
+        if args.gui_message == "":
+            gui_mess = GUI_MESSAGE_DEFAULT
+        else:
+            gui_mess = args.gui_message
+
         # Prompt the user to select a deferment
-        secs = display_prompt()
+        secs = display_prompt(gui_head, gui_mess, defer_max, console_user_uid)
         if secs is None:
             # Encountered an error, bail
-            display_error()
+            display_error(console_user_uid)
             sys.exit(1)
 
         # Again, Jamf may pass a literal "" (blank) value so check for that in
@@ -358,8 +442,9 @@ def main():
 
         # Handle start interval of LaunchDaemon based on user's deferrment
         if secs == 0:
-            # User chose to "start now" so add the RunAtLoad key
-            daemon['RunAtLoad'] = True
+            # User chose to "start now" so we will kickstart the LaunchDaemon.
+            ld_kickstart = True
+
         else:
             # User chose to defer, so calculate the deltas and set the
             # StartCalendarInterval key
@@ -368,17 +453,18 @@ def main():
                                             'Hour': hour,
                                             'Minute': minute
                                             }
+            ld_kickstart = False
 
         # Try to write the LaunchDaemon
-        if write_launchdaemon(daemon, ld_path):
+        if write_launchdaemon(daemon, ld_path, ld_label, ld_kickstart):
             # Show confirmation of selected date if deferred
             if secs > 0:
-                display_confirm(datestring)
+                display_confirm(datestring, console_user_uid)
 
             sys.exit(0)
 
         else:
-            display_error()
+            display_error(console_user_uid)
             sys.exit(1)
 
     elif args.mode == 'cleanup':
